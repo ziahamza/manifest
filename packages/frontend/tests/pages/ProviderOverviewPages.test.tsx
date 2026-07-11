@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor } from '@solidjs/testing-library';
 import { Show } from 'solid-js';
+import { FREE_PLAN_REQUESTS_PER_MONTH } from 'manifest-shared';
 
 const routerState = vi.hoisted(() => ({
   navigate: vi.fn(),
@@ -17,9 +18,11 @@ const apiMocks = vi.hoisted(() => ({
   renameProviderKey: vi.fn(),
   refreshModels: vi.fn(),
   fetchMutate: vi.fn(),
+  fetchJson: vi.fn(),
   getOverview: vi.fn(),
   getOverviewAgentUsage: vi.fn(),
   getOverviewProviderUsage: vi.fn(),
+  getBillingStatus: vi.fn(),
   getConnectionDetail: vi.fn(),
   getProviderAnalytics: vi.fn(),
   getPerAgentTimeseries: vi.fn(),
@@ -39,9 +42,11 @@ vi.mock('@solidjs/router', () => ({
   ),
   useNavigate: () => routerState.navigate,
   useParams: () => routerState.params,
+  useSearchParams: () => [{}],
 }));
 
 vi.mock('../../src/services/api/core.js', () => ({
+  fetchJson: (...args: unknown[]) => apiMocks.fetchJson(...args),
   fetchMutate: (...args: unknown[]) => apiMocks.fetchMutate(...args),
   routingPath: (agent: string, path: string) => `/api/v1/routing/${agent}/${path}`,
 }));
@@ -78,6 +83,10 @@ vi.mock('../../src/services/api/analytics.js', () => ({
   getPerAgentMessageTimeseries: (...args: unknown[]) =>
     apiMocks.getPerAgentMessageTimeseries(...args),
   getPerAgentCostTimeseries: (...args: unknown[]) => apiMocks.getPerAgentCostTimeseries(...args),
+}));
+
+vi.mock('../../src/services/api/billing.js', () => ({
+  getBillingStatus: (...args: unknown[]) => apiMocks.getBillingStatus(...args),
 }));
 
 vi.mock('../../src/services/providers.js', () => ({
@@ -154,11 +163,23 @@ vi.mock('../../src/components/Select.jsx', () => ({
   default: (props: {
     value: string;
     onChange: (value: string) => void;
-    options: Array<{ label: string; value: string }>;
+    options: Array<{
+      label: string;
+      value: string;
+      disabled?: boolean;
+      description?: string;
+      badge?: unknown;
+    }>;
   }) => (
     <select value={props.value} onChange={(e) => props.onChange(e.currentTarget.value)}>
       {props.options.map((option) => (
-        <option value={option.value}>{option.label}</option>
+        <option value={option.value} disabled={option.disabled}>
+          {option.description
+            ? `${option.label} · ${option.description}`
+            : option.badge
+              ? `${option.label} · PRO`
+              : option.label}
+        </option>
       ))}
     </select>
   ),
@@ -239,7 +260,16 @@ vi.mock('../../src/services/connection-breadcrumb-store.js', () => ({
   setConnectionBreadcrumb: vi.fn(),
 }));
 
+const { MOCK_FREE_PLAN_REQUESTS_PER_MONTH } = vi.hoisted(() => ({
+  MOCK_FREE_PLAN_REQUESTS_PER_MONTH: 10_000,
+}));
+
 vi.mock('manifest-shared', () => ({
+  FREE_PLAN_REQUESTS_PER_MONTH: MOCK_FREE_PLAN_REQUESTS_PER_MONTH,
+  PLAN_LIMITS: {
+    free: { requestsPerMonth: MOCK_FREE_PLAN_REQUESTS_PER_MONTH },
+    pro: { requestsPerMonth: null },
+  },
   platformIcon: () => 'robot',
   PLATFORM_LABELS: { codex: 'Codex' },
   // routing-utils (imported by GlobalOverview for stripCustomPrefix) reads
@@ -313,34 +343,41 @@ const overviewResponse = {
   ],
   recent_activity: [
     {
+      id: 'msg-recent-1',
       timestamp: '2026-06-04T10:00:00Z',
       agent_name: 'demo-agent',
       model: 'gpt-5',
+      input_tokens: 800,
+      output_tokens: 400,
       total_tokens: 1200,
       provider: 'openai',
       auth_type: 'api_key',
       status: 'ok',
-      first_message: 'Hello',
-      cost_usd: 1.23,
+      cost: 1.23,
     },
     {
+      id: 'msg-recent-2',
       timestamp: '2026-06-04T09:00:00Z',
       agent_name: 'demo-agent',
       model: 'gpt-5',
+      input_tokens: 30,
+      output_tokens: 20,
       total_tokens: 50,
       provider: 'openai',
       auth_type: 'api_key',
       status: 'retry',
-      description: 'Retry message',
-      cost_usd: 0.01,
+      cost: 0.01,
     },
     {
+      id: 'msg-recent-3',
       timestamp: '2026-06-04T08:00:00Z',
       agent_name: 'worker-agent',
       model: '',
+      input_tokens: 0,
+      output_tokens: 0,
       total_tokens: 0,
       status: 'error',
-      cost_usd: 0,
+      cost: 0,
     },
   ],
   has_data: true,
@@ -607,9 +644,18 @@ beforeEach(() => {
   apiMocks.renameProviderKey.mockResolvedValue(undefined);
   apiMocks.refreshModels.mockResolvedValue(undefined);
   apiMocks.fetchMutate.mockResolvedValue({});
+  apiMocks.fetchJson.mockResolvedValue({ providers: [] });
   apiMocks.getOverview.mockResolvedValue(overviewResponse);
   apiMocks.getOverviewAgentUsage.mockResolvedValue(agentUsageTimeseries);
   apiMocks.getOverviewProviderUsage.mockResolvedValue(providerUsageTimeseries);
+  apiMocks.getBillingStatus.mockResolvedValue({
+    enabled: false,
+    plan: 'free',
+    priceMonthly: { amount: null, currency: null, interval: null },
+    requests: { used: null, limit: null, periodEnd: null },
+    cancelAtPeriodEnd: false,
+    subscriptionPeriodEnd: null,
+  });
   apiMocks.getConnectionDetail.mockResolvedValue(connectionDetail);
   apiMocks.getProviderAnalytics.mockResolvedValue(connectionAnalytics);
   apiMocks.getPerAgentTimeseries.mockResolvedValue(agentTimeseries);
@@ -658,9 +704,10 @@ describe('GlobalOverview (analytics)', () => {
     expect(screen.getByText('All your harnesses and providers')).toBeDefined();
     expect(screen.getAllByText('Demo Agent').length).toBeGreaterThan(0);
     expect(screen.getAllByText('OpenAI').length).toBeGreaterThan(0);
+    // The shared MessageTable renders a binary status: the ok row is "Success"
+    // and the non-ok rows (retry + error) both render "Failed".
     expect(screen.getByText('Success')).toBeDefined();
-    expect(screen.getByText('Retried')).toBeDefined();
-    expect(screen.getByText('Failed')).toBeDefined();
+    expect(screen.getAllByText('Failed').length).toBe(2);
     // custom provider name resolves asynchronously
     await waitFor(() => expect(screen.getAllByText('Custom Provider').length).toBeGreaterThan(0));
     // model usage + provider connection rows render
@@ -739,6 +786,40 @@ describe('GlobalOverview (analytics)', () => {
     expect(saved).not.toContain('worker-agent');
 
     fireEvent.keyDown(document, { key: 'Escape' });
+  });
+
+  it('limits Free users to 7-day dashboard ranges and labels longer ranges as Pro-only', async () => {
+    localStorage.setItem('manifest_global_range', '365d');
+    apiMocks.getBillingStatus.mockResolvedValue({
+      enabled: true,
+      plan: 'free',
+      priceMonthly: { amount: 20, currency: 'USD', interval: 'month' },
+      emailPreferences: { usageAlerts: true },
+      requests: {
+        used: 120,
+        limit: FREE_PLAN_REQUESTS_PER_MONTH,
+        periodEnd: '2026-08-01T00:00:00.000Z',
+      },
+      cancelAtPeriodEnd: false,
+      subscriptionPeriodEnd: null,
+    });
+
+    render(() => <GlobalOverview />);
+
+    await waitFor(() => expect(screen.getByTestId('provider-chart-card')).toBeDefined());
+    await waitFor(() => expect(localStorage.getItem('manifest_global_range')).toBe('7d'));
+    expect(apiMocks.getOverview).toHaveBeenCalledWith('7d');
+
+    const selects = screen.getAllByRole('combobox') as HTMLSelectElement[];
+    const rangeSelect = selects[1]!;
+    const lockedOptions = Array.from(rangeSelect.options).filter((option) =>
+      ['30d', '90d', '365d'].includes(option.value),
+    );
+    expect(lockedOptions.map((option) => option.disabled)).toEqual([true, true, true]);
+    expect(screen.getByText('Last 30 days · PRO')).toBeDefined();
+
+    fireEvent.change(rangeSelect, { target: { value: '90d' } });
+    expect(localStorage.getItem('manifest_global_range')).toBe('7d');
   });
 
   it('keeps series visible when switching groupings (selection scoped per group)', async () => {
@@ -969,11 +1050,160 @@ describe('ConnectionDetail (analytics)', () => {
     }
   });
 
+  it('renders detailed subscription limits with pace, balances, and reset windows', async () => {
+    const resetIn = (milliseconds: number) => new Date(Date.now() + milliseconds).toISOString();
+    const quotaWindow = (overrides: Record<string, unknown>) => ({
+      id: 'quota',
+      label: 'Quota',
+      used_percent: 20,
+      remaining_percent: 80,
+      resets_at: resetIn(2.5 * 60 * 60 * 1000),
+      window_seconds: 5 * 60 * 60,
+      current: null,
+      limit: null,
+      unit: null,
+      ...overrides,
+    });
+
+    apiMocks.getConnectionDetail.mockResolvedValue({
+      ...connectionDetail,
+      connection: {
+        ...connectionDetail.connection,
+        auth_type: 'subscription',
+        label: 'ChatGPT',
+      },
+    });
+    apiMocks.fetchJson.mockResolvedValue({
+      providers: [
+        {
+          provider: 'openai',
+          auth_type: 'subscription',
+          status: 'ok',
+          updated_at: new Date().toISOString(),
+          connections: [
+            {
+              id: 'conn-openai',
+              label: 'ChatGPT',
+              status: 'ok',
+              message: null,
+              updated_at: new Date().toISOString(),
+              windows: [
+                quotaWindow({
+                  id: 'healthy',
+                  label: 'Codex 5h',
+                  current: 2,
+                  limit: 10,
+                  unit: 'requests',
+                }),
+                quotaWindow({
+                  id: 'risk',
+                  label: 'Codex weekly',
+                  used_percent: 80,
+                  remaining_percent: 20,
+                  resets_at: resetIn(6 * 24 * 60 * 60 * 1000),
+                  window_seconds: 7 * 24 * 60 * 60,
+                  current: 80,
+                  unit: 'credits',
+                }),
+                quotaWindow({
+                  id: 'exhausted',
+                  label: 'Monthly credits',
+                  used_percent: 100,
+                  remaining_percent: 0,
+                  resets_at: resetIn(25 * 24 * 60 * 60 * 1000),
+                  window_seconds: 30 * 24 * 60 * 60,
+                  limit: 100,
+                  unit: 'USD',
+                }),
+                quotaWindow({
+                  id: 'balance',
+                  label: 'Credits balance',
+                  used_percent: null,
+                  remaining_percent: null,
+                  resets_at: null,
+                  window_seconds: null,
+                  current: 25,
+                  unit: 'credits',
+                }),
+                quotaWindow({
+                  id: 'tracked',
+                  label: 'Tracked quota',
+                  resets_at: null,
+                  window_seconds: 45,
+                }),
+              ],
+            },
+          ],
+        },
+      ],
+    });
+
+    const { container } = render(() => <ConnectionDetail />);
+
+    await waitFor(() => expect(screen.getByText('Subscription limits')).toBeDefined());
+    await waitFor(() => expect(screen.getByText('Codex 5h')).toBeDefined());
+    expect(screen.getByText('On track')).toBeDefined();
+    expect(screen.getByText('At risk')).toBeDefined();
+    expect(screen.getByText('Exhausted')).toBeDefined();
+    expect(screen.getByText('Balance')).toBeDefined();
+    expect(screen.getByText('Tracked')).toBeDefined();
+    expect(screen.getByText('2 requests / 10 requests')).toBeDefined();
+    expect(screen.getByText('80 credits')).toBeDefined();
+    expect(screen.getByText('100 USD limit')).toBeDefined();
+    expect(screen.getByText('25 credits')).toBeDefined();
+    expect(screen.getByText('7d')).toBeDefined();
+    expect(screen.getByText('45s')).toBeDefined();
+    expect(screen.getAllByText(/Projected .* by reset/).length).toBeGreaterThan(0);
+
+    const limitsScroller = screen.getByText('Codex 5h').closest('.scroll-panel__body');
+    if (limitsScroller) fireEvent.scroll(limitsScroller);
+    expect(container.querySelectorAll('table.data-table').length).toBeGreaterThan(0);
+  });
+
+  it('shows subscription loading and unavailable states for the current connection', async () => {
+    apiMocks.getConnectionDetail.mockResolvedValue({
+      ...connectionDetail,
+      connection: { ...connectionDetail.connection, auth_type: 'subscription' },
+    });
+    apiMocks.fetchJson.mockReturnValueOnce(new Promise(() => {}));
+
+    const loading = render(() => <ConnectionDetail />);
+    await waitFor(() => expect(screen.getByText('Subscription limits')).toBeDefined());
+    expect(loading.container.querySelector('[style*="skeleton-pulse"]')).not.toBeNull();
+    loading.unmount();
+
+    apiMocks.fetchJson.mockResolvedValueOnce({
+      providers: [
+        {
+          provider: 'openai',
+          auth_type: 'subscription',
+          status: 'unavailable',
+          updated_at: null,
+          connections: [
+            {
+              id: 'conn-openai',
+              label: 'Default',
+              status: 'unavailable',
+              message: 'Sign in again to refresh usage limits',
+              updated_at: null,
+              windows: [],
+            },
+          ],
+        },
+      ],
+    });
+    render(() => <ConnectionDetail />);
+    await waitFor(() =>
+      expect(screen.getByText('Sign in again to refresh usage limits')).toBeDefined(),
+    );
+  });
+
   it('persists chart range/view and harness filter selection', async () => {
     render(() => <ConnectionDetail />);
     await waitFor(() => expect(screen.getAllByText('Default').length).toBeGreaterThan(0));
 
-    fireEvent.change(screen.getByDisplayValue('Last 7 days'), { target: { value: '365d' } });
+    const rangeSelect = screen.getByRole('combobox') as HTMLSelectElement;
+    fireEvent.change(rangeSelect, { target: { value: '365d' } });
     expect(sessionStorage.getItem('chart-range:conn-openai')).toBe('365d');
 
     fireEvent.click(screen.getByText('Messages chart'));
@@ -1331,7 +1561,7 @@ describe('ConnectionDetail (analytics)', () => {
     await waitFor(() => expect(screen.getAllByText('Default').length).toBeGreaterThan(0));
 
     // range + view persistence both throw and are swallowed
-    fireEvent.change(screen.getByDisplayValue('Last 7 days'), { target: { value: '30d' } });
+    fireEvent.change(screen.getByRole('combobox'), { target: { value: '30d' } });
     fireEvent.click(screen.getByText('Messages chart'));
 
     // filter persistence (toggle / select all) all throw + swallow
