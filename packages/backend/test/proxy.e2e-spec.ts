@@ -108,6 +108,7 @@ describe('Proxy E2E — /v1/models', () => {
         { id: 'auto', object: 'model', created: 0, owned_by: 'manifest' },
         { id: 'openai/gpt-4o-mini', object: 'model', created: 0, owned_by: 'openai' },
       ],
+      models: [],
     });
   });
 });
