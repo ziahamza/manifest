@@ -1048,6 +1048,31 @@ describe('Anthropic Adapter', () => {
       expect(result).toBeNull();
     });
 
+    it('converts Anthropic stream errors to a terminal provider error chunk', () => {
+      const transform = createAnthropicStreamTransformer('claude-sonnet-4-20250514');
+      const result = transform(
+        'event: error\n{"type":"error","error":{"type":"rate_limit_error","message":"Too many requests"}}',
+      );
+
+      expect(result).toBe(
+        'data: {"error":{"message":"Too many requests","type":"rate_limit_error","status":429}}\n\n',
+      );
+      expect(
+        transform(
+          'event: content_block_delta\n{"type":"content_block_delta","delta":{"type":"text_delta","text":"must be ignored"}}',
+        ),
+      ).toBeNull();
+    });
+
+    it('sanitizes malformed top-level stream errors with safe defaults', () => {
+      const transform = createAnthropicStreamTransformer('claude-sonnet-4-20250514');
+      const result = transform('event: error\n{"code":"vendor_failure"}');
+
+      expect(result).toBe(
+        'data: {"error":{"message":"Upstream provider stream failed","type":"api_error","code":"vendor_failure"}}\n\n',
+      );
+    });
+
     it('converts message_start to initial role chunk', () => {
       const chunk =
         'event: message_start\n{"type":"message_start","message":{"id":"msg_01","role":"assistant"}}';
@@ -2183,6 +2208,48 @@ describe('Anthropic Adapter', () => {
   });
 
   describe('applyAnthropicMessagesMutations', () => {
+    it('adds only subscription identity/cache fields to a native Claude body', () => {
+      const inbound = {
+        model: 'claude-sonnet-4-6',
+        stream: true,
+        system: 'Native system',
+        context_management: { edits: [{ type: 'clear_tool_uses_20250919' }] },
+        messages: [
+          {
+            role: 'assistant',
+            content: [
+              { type: 'thinking', thinking: 'native', signature: '' },
+              { type: 'tool_use', id: 'call_1', name: 'search', input: { q: 'cats' } },
+            ],
+          },
+        ],
+      };
+      const lookup = jest
+        .fn()
+        .mockReturnValue([{ type: 'thinking', thinking: 'cached', signature: 'cached-signature' }]);
+
+      const result = applyAnthropicMessagesMutations(inbound, {
+        preserveNativeBody: true,
+        injectSubscriptionIdentity: true,
+        thinkingLookup: lookup,
+      });
+
+      expect(result).toMatchObject({
+        model: inbound.model,
+        stream: inbound.stream,
+        context_management: inbound.context_management,
+        messages: inbound.messages,
+      });
+      expect(result.system).toEqual([
+        expect.objectContaining({ type: 'text', text: expect.stringMatching(/Claude agent/) }),
+        { type: 'text', text: 'Native system', cache_control: { type: 'ephemeral' } },
+      ]);
+      expect(result).not.toHaveProperty('max_tokens');
+      expect(result).not.toBe(inbound);
+      expect(inbound.system).toBe('Native system');
+      expect(lookup).not.toHaveBeenCalled();
+    });
+
     it('preserves Anthropic server tools with their type discriminator and skips input_schema (issue #1886)', () => {
       const inbound = {
         model: 'claude-sonnet-4-20250514',
@@ -2267,7 +2334,7 @@ describe('Anthropic Adapter', () => {
       const system = result.system as Array<Record<string, unknown>>;
       expect(system).toHaveLength(1);
       expect(system[0].text).toMatch(/Claude agent/);
-      expect(system[0].cache_control).toBeUndefined();
+      expect(system[0].cache_control).toEqual({ type: 'ephemeral' });
     });
 
     it('drops system when input has none and no mutations need it', () => {

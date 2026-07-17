@@ -1105,6 +1105,112 @@ describe('ProxyController', () => {
     });
   });
 
+  it('returns thrown failures as Anthropic errors on /v1/messages even when streaming', async () => {
+    proxyService.proxyRequest.mockRejectedValue(new Error('Sensitive internal failure'));
+    const req = mockRequest({
+      model: 'auto',
+      max_tokens: 1024,
+      stream: true,
+      messages: [{ role: 'user', content: 'test' }],
+    });
+    const { res } = mockResponse();
+
+    await controller.messages(req as never, res as never);
+
+    expect(res.status).toHaveBeenCalledWith(500);
+    expect(res.json).toHaveBeenCalledWith({
+      type: 'error',
+      error: {
+        type: 'api_error',
+        message: 'Manifest encountered an internal error. Try again shortly.',
+      },
+    });
+  });
+
+  it('maps collected Responses SSE failures to Anthropic errors on /v1/messages', async () => {
+    proxyService.proxyRequest.mockRejectedValue(
+      new ResponsesSseError('Bad upstream request', 400, '{"error":"bad"}'),
+    );
+    const req = mockRequest({
+      model: 'auto',
+      max_tokens: 1024,
+      messages: [{ role: 'user', content: 'test' }],
+    });
+    const { res } = mockResponse();
+
+    await controller.messages(req as never, res as never);
+
+    expect(res.status).toHaveBeenCalledWith(400);
+    expect(res.json).toHaveBeenCalledWith({
+      type: 'error',
+      error: { type: 'invalid_request_error', message: 'Bad upstream request' },
+    });
+  });
+
+  it('returns thrown failures as OpenAI errors on /v1/responses even when streaming', async () => {
+    proxyService.proxyRequest.mockRejectedValue(new HttpException('Bad Responses input', 400));
+    const req = mockRequest({ model: 'auto', stream: true, input: 'test' });
+    const { res } = mockResponse();
+
+    await controller.responses(req as never, res as never);
+
+    expect(res.status).toHaveBeenCalledWith(400);
+    expect(res.json).toHaveBeenCalledWith({
+      error: { message: 'Bad Responses input', type: 'invalid_request_error' },
+    });
+  });
+
+  it('maps rate limits to an OpenAI error on /v1/responses', async () => {
+    proxyService.proxyRequest.mockRejectedValue(new HttpException('Slow down', 429));
+    const req = mockRequest({ model: 'auto', input: 'test' });
+    const { res } = mockResponse();
+
+    await controller.responses(req as never, res as never);
+
+    expect(res.status).toHaveBeenCalledWith(429);
+    expect(res.json).toHaveBeenCalledWith({
+      error: { message: 'Slow down', type: 'rate_limit_error' },
+    });
+  });
+
+  it('returns Manifest setup stubs as real Anthropic errors instead of assistant success', async () => {
+    proxyService.proxyRequest.mockResolvedValue({
+      forward: {
+        response: new Response(
+          JSON.stringify({ choices: [{ message: { role: 'assistant', content: 'setup' } }] }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        ),
+        isGoogle: false,
+        isAnthropic: false,
+        isChatGpt: false,
+      },
+      meta: {
+        tier: 'simple',
+        model: 'manifest',
+        provider: 'manifest',
+        confidence: 1,
+        reason: 'no_provider',
+        manifest_error_code: 'M101',
+        manifest_error_message: 'No providers configured',
+      },
+    });
+    const req = mockRequest({
+      model: 'auto',
+      max_tokens: 1024,
+      stream: true,
+      messages: [{ role: 'user', content: 'test' }],
+    });
+    const { res } = mockResponse();
+
+    await controller.messages(req as never, res as never);
+
+    expect(res.status).toHaveBeenCalledWith(503);
+    expect(res.json).toHaveBeenCalledWith({
+      type: 'error',
+      error: { type: 'api_error', message: 'No providers configured' },
+    });
+  });
+
   it('should forward HttpException as friendly chat message', async () => {
     proxyService.proxyRequest.mockRejectedValue(
       new HttpException('Bad request: messages required', 400),
