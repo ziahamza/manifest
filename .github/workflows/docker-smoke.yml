@@ -22,6 +22,7 @@ on:
       - "package-lock.json"
       - "turbo.json"
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
