@@ -2,7 +2,7 @@ import { Logger } from '@nestjs/common';
 import { Response as ExpressResponse } from 'express';
 import { IngestionContext } from '../../otlp/interfaces/ingestion-context.interface';
 import { RoutingMeta } from './proxy.service';
-import type { AutofixRecord } from '../autofix/autofix.types';
+import { getAutofixRetry, type AutofixRecord } from '../autofix/autofix.types';
 import { FailedFallback } from './proxy-fallback.service';
 import { ForwardResult } from './provider-client';
 import { ProxyMessageRecorder } from './proxy-message-recorder';
@@ -24,9 +24,12 @@ import {
   createResponsesStreamTransformer,
   fromChatCompletionResponse,
 } from './responses-adapter';
+import { ResponsesSseError } from './chatgpt-adapter';
 import {
   chatCompletionsResponseToMessages,
+  createAnthropicPassthroughStreamValidator,
   createMessagesStreamTransformer,
+  type MessagesStreamFailure,
 } from './anthropic-messages-adapter';
 import type { ProxyApiMode } from './proxy-types';
 import { anthropicErrorTypeForStatus } from './proxy-protocol-error';
@@ -51,8 +54,143 @@ import {
 
 const logger = new Logger('ProxyResponseHandler');
 
+function upstreamProtocolError(message: string): ResponsesSseError {
+  return new ResponsesSseError(
+    message,
+    502,
+    JSON.stringify({
+      error: {
+        type: 'upstream_protocol_error',
+        code: 'invalid_upstream_response',
+        message,
+      },
+    }),
+  );
+}
+
+async function readProviderJson(response: Response): Promise<unknown> {
+  const text = await response.text();
+  if (!text.trim()) throw upstreamProtocolError('Upstream provider returned an empty response');
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw upstreamProtocolError('Upstream provider returned malformed JSON');
+  }
+}
+
+function hasMeaningfulChatCompletion(message: unknown): boolean {
+  if (!message || typeof message !== 'object' || Array.isArray(message)) return false;
+  const record = message as Record<string, unknown>;
+  if (typeof record.content === 'string' && record.content.trim()) return true;
+  if (typeof record.reasoning_content === 'string' && record.reasoning_content.trim()) return true;
+  if (
+    Array.isArray(record.content) &&
+    record.content.some(
+      (block) =>
+        !!block &&
+        typeof block === 'object' &&
+        !Array.isArray(block) &&
+        typeof (block as Record<string, unknown>).text === 'string' &&
+        Boolean(((block as Record<string, unknown>).text as string).trim()),
+    )
+  ) {
+    return true;
+  }
+  return (
+    Array.isArray(record.tool_calls) &&
+    record.tool_calls.some((call) => {
+      if (!call || typeof call !== 'object' || Array.isArray(call)) return false;
+      const fn = (call as Record<string, unknown>).function;
+      return (
+        !!fn &&
+        typeof fn === 'object' &&
+        !Array.isArray(fn) &&
+        typeof (fn as Record<string, unknown>).name === 'string' &&
+        Boolean(((fn as Record<string, unknown>).name as string).trim())
+      );
+    })
+  );
+}
+
+function assertChatCompletionIntegrity(responseBody: unknown): void {
+  const body = responseBody as Record<string, unknown> | null;
+  const choices = Array.isArray(body?.choices) ? body.choices : [];
+  const choice = choices[0];
+  if (!choice || typeof choice !== 'object' || Array.isArray(choice)) {
+    throw upstreamProtocolError('Upstream provider returned an empty completion');
+  }
+  const record = choice as Record<string, unknown>;
+  if (!hasMeaningfulChatCompletion(record.message)) {
+    throw upstreamProtocolError('Upstream provider returned an empty completion');
+  }
+  if (typeof record.finish_reason !== 'string' || !record.finish_reason.trim()) {
+    throw upstreamProtocolError('Upstream provider response omitted a terminal finish reason');
+  }
+}
+
+function hasMeaningfulAnthropicContent(content: unknown): boolean {
+  if (typeof content === 'string') return Boolean(content.trim());
+  if (!Array.isArray(content)) return false;
+  return content.some((block) => {
+    if (!block || typeof block !== 'object' || Array.isArray(block)) return false;
+    const record = block as Record<string, unknown>;
+    if (typeof record.text === 'string' && record.text.trim()) return true;
+    if (typeof record.thinking === 'string' && record.thinking.trim()) return true;
+    if (typeof record.data === 'string' && record.data.trim()) return true;
+    if (typeof record.name === 'string' && record.name.trim()) return true;
+    return Array.isArray(record.content) && record.content.length > 0;
+  });
+}
+
+function assertAnthropicCompletionIntegrity(responseBody: unknown): void {
+  const body = responseBody as Record<string, unknown> | null;
+  if (!hasMeaningfulAnthropicContent(body?.content)) {
+    throw upstreamProtocolError('Upstream provider returned an empty completion');
+  }
+  if (typeof body?.stop_reason !== 'string' || !body.stop_reason.trim()) {
+    throw upstreamProtocolError('Upstream provider response omitted a terminal stop reason');
+  }
+}
+
 function recordSafely(promise: Promise<unknown>, label: string): void {
   promise.catch((e) => logger.warn(`Failed to record ${label}: ${e}`));
+}
+
+function recordAutofixOriginalIfRetried(
+  ctx: IngestionContext,
+  meta: RoutingMeta,
+  recorder: ProxyMessageRecorder,
+  autofix: AutofixRecord | undefined,
+  traceId?: string,
+  callerAttribution?: CallerAttribution | null,
+  requestHeaders?: Record<string, string> | null,
+  route?: {
+    model?: string;
+    provider?: string;
+    authType?: string;
+    tenantProviderId?: string | null;
+  },
+): void {
+  if (!autofix || !getAutofixRetry(autofix)) return;
+  recordSafely(
+    recorder.recordAutofixOriginal(ctx, route?.model ?? meta.model, meta.tier, autofix, {
+      provider: route ? route.provider : meta.provider,
+      reason: meta.reason,
+      authType: route?.authType ?? meta.auth_type,
+      traceId,
+      callerAttribution,
+      requestHeaders,
+      requestParams: meta.request_params,
+      specificityCategory: meta.specificity_category,
+      providerKeyLabel: meta.provider_key_label,
+      tenantProviderId:
+        route?.tenantProviderId === undefined ? meta.tenantProviderId : route.tenantProviderId,
+      headerTierId: meta.header_tier_id,
+      headerTierName: meta.header_tier_name,
+      headerTierColor: meta.header_tier_color,
+    }),
+    'autofix original',
+  );
 }
 
 function thinkingRouteContext(meta: RoutingMeta): ThinkingBlockRouteContext {
@@ -239,6 +377,16 @@ export async function handleProviderError(
   autofix?: AutofixRecord,
   responseContext?: ProviderErrorResponseContext,
 ): Promise<void> {
+  recordAutofixOriginalIfRetried(
+    ctx,
+    meta,
+    recorder,
+    autofix,
+    traceId,
+    callerAttribution,
+    requestHeaders,
+  );
+
   if (failedFallbacks && failedFallbacks.length > 0 && !meta.fallbackFromModel) {
     await handleFallbackExhausted(
       res,
@@ -342,8 +490,9 @@ function handleFallbackExhausted(
         headerTierId: meta.header_tier_id,
         headerTierName: meta.header_tier_name,
         headerTierColor: meta.header_tier_color,
-        // Auto-fix ran on this primary before the chain exhausted — stamp its
-        // audit onto the single primary-failure row (no separate `auto_fixed`).
+        httpStatus: errorStatus,
+        // When a patched retry exists this row is that retry; otherwise it is
+        // the plain original failure carrying only Phoenix's audit.
         autofix,
       },
     ),
@@ -386,6 +535,21 @@ export function recordFallbackFailures(
   // (see RoutingMeta.primaryAuthType / #1173). Older meta shapes only carry
   // `auth_type`, so fall back to it when primaryAuthType is absent.
   const primaryAuthType = meta.primaryAuthType ?? meta.auth_type;
+  recordAutofixOriginalIfRetried(
+    ctx,
+    meta,
+    recorder,
+    autofix,
+    undefined,
+    callerAttribution,
+    requestHeaders,
+    {
+      model: meta.fallbackFromModel,
+      provider: meta.primaryProvider,
+      authType: primaryAuthType,
+      tenantProviderId: meta.primaryTenantProviderId,
+    },
+  );
   recordSafely(
     recorder.recordPrimaryFailure(
       ctx,
@@ -414,9 +578,9 @@ export function recordFallbackFailures(
         headerTierId: meta.header_tier_id,
         headerTierName: meta.header_tier_name,
         headerTierColor: meta.header_tier_color,
-        // Heal-then-fallback: stamp the Auto-fix audit onto the single primary
-        // row here; `recordAutofixOriginals` is guarded on outcome==='healed'
-        // so it no longer emits a duplicate `auto_fixed` row for this failure.
+        httpStatus: meta.primaryErrorStatus,
+        // A failed patched retry is the primary failure that triggered fallback.
+        // No-patch consultations remain an unmarked original with audit only.
         autofix,
       },
     ),
@@ -455,6 +619,7 @@ export async function handleStreamResponse(
   thinkingCache?: ThinkingBlockCache,
   apiMode: ProxyApiMode = 'chat_completions',
   reasoningCache?: ReasoningContentCache,
+  onIntegrityFailure?: (failure: MessagesStreamFailure) => void,
 ): Promise<StreamUsage | null> {
   copySafeProviderResponseHeaders(res, forward.response.headers, apiMode);
   initSseHeaders(res, metaHeaders, 200);
@@ -481,30 +646,42 @@ export async function handleStreamResponse(
   const toClientChunk = streamTransformer
     ? (chunk: string) => streamTransformer.transform(chunk)
     : (chunk: string) => chunk;
+  const complete = async (
+    stream: Promise<StreamUsage | null>,
+    getFailure: () => MessagesStreamFailure | null = () =>
+      messagesTransformer?.getFailure() ?? null,
+  ): Promise<StreamUsage | null> => {
+    const usage = await stream;
+    const failure = getFailure();
+    if (failure) onIntegrityFailure?.(failure);
+    return usage;
+  };
 
   if (apiMode === 'responses' && forward.isResponses) {
-    return pipeStream(forward.response.body!, res, undefined, undefined, onClient);
+    return complete(pipeStream(forward.response.body!, res, undefined, undefined, onClient));
   }
 
   if (forward.isGoogle) {
-    return pipeStream(
-      forward.response.body!,
-      res,
-      (chunk) => {
-        const innerChunk = forward.isCodeAssist ? unwrapCodeAssistStreamPayload(chunk) : chunk;
-        const { chunk: out, signatures } = providerClient.convertGoogleStreamChunk(
-          innerChunk,
-          meta.model,
-        );
-        if (signatureCache && sessionKey) {
-          for (const s of signatures) {
-            signatureCache.store(sessionKey, s.toolCallId, s.signature);
+    return complete(
+      pipeStream(
+        forward.response.body!,
+        res,
+        (chunk) => {
+          const innerChunk = forward.isCodeAssist ? unwrapCodeAssistStreamPayload(chunk) : chunk;
+          const { chunk: out, signatures } = providerClient.convertGoogleStreamChunk(
+            innerChunk,
+            meta.model,
+          );
+          if (signatureCache && sessionKey) {
+            for (const s of signatures) {
+              signatureCache.store(sessionKey, s.toolCallId, s.signature);
+            }
           }
-        }
-        return out ? toClientChunk(out) : null;
-      },
-      finalize,
-      onClient,
+          return out ? toClientChunk(out) : null;
+        },
+        finalize,
+        onClient,
+      ),
     );
   }
   if (forward.isAnthropic) {
@@ -526,30 +703,47 @@ export async function handleStreamResponse(
     // transformer runs purely as a tap — thinking-block cache via callback
     // and OpenAI-shape usage parsed off its return value by pipePassthrough.
     if (apiMode === 'messages') {
-      return pipePassthrough(forward.response.body!, res, anthropicTransformer, onClient);
+      const validator = createAnthropicPassthroughStreamValidator();
+      return complete(
+        pipePassthrough(
+          forward.response.body!,
+          res,
+          (event) => {
+            validator.observe(event);
+            return anthropicTransformer(event);
+          },
+          onClient,
+          () => validator.finalize(),
+        ),
+        () => validator.getFailure(),
+      );
     }
-    return pipeStream(
-      forward.response.body!,
-      res,
-      (chunk) => {
-        const out = anthropicTransformer(chunk);
-        return out ? toClientChunk(out) : null;
-      },
-      finalize,
-      onClient,
+    return complete(
+      pipeStream(
+        forward.response.body!,
+        res,
+        (chunk) => {
+          const out = anthropicTransformer(chunk);
+          return out ? toClientChunk(out) : null;
+        },
+        finalize,
+        onClient,
+      ),
     );
   }
   if (forward.isChatGpt) {
-    return pipeStream(
-      forward.response.body!,
-      res,
-      (chunk) => {
-        const out = providerClient.convertChatGptStreamChunk(chunk, meta.model);
-        if (!messagesTransformer) return out;
-        return out ? toClientChunk(out) : null;
-      },
-      finalize,
-      onClient,
+    return complete(
+      pipeStream(
+        forward.response.body!,
+        res,
+        (chunk) => {
+          const out = providerClient.convertChatGptStreamChunk(chunk, meta.model);
+          if (!messagesTransformer) return out;
+          return out ? toClientChunk(out) : null;
+        },
+        finalize,
+        onClient,
+      ),
     );
   }
   const reasoningStreamFormat = getOpenAiReasoningStreamFormat(meta.provider, meta.model);
@@ -564,21 +758,23 @@ export async function handleStreamResponse(
       onReasoningContent,
       reasoningStreamFormat,
     );
-    return pipeStream(
-      forward.response.body!,
-      res,
-      (chunk) => {
-        const out = transformer(chunk);
-        return out ? toClientChunk(out) : null;
-      },
-      finalize,
-      onClient,
+    return complete(
+      pipeStream(
+        forward.response.body!,
+        res,
+        (chunk) => {
+          const out = transformer(chunk);
+          return out ? toClientChunk(out) : null;
+        },
+        finalize,
+        onClient,
+      ),
     );
   }
   if (apiMode === 'responses' || apiMode === 'messages') {
-    return pipeStream(forward.response.body!, res, toClientChunk, finalize, onClient);
+    return complete(pipeStream(forward.response.body!, res, toClientChunk, finalize, onClient));
   }
-  return pipeStream(forward.response.body!, res, undefined, undefined, onClient);
+  return complete(pipeStream(forward.response.body!, res, undefined, undefined, onClient));
 }
 
 function cacheReasoningContent(
@@ -630,7 +826,7 @@ export async function handleNonStreamResponse(
   if (apiMode === 'responses' && forward.isResponses) {
     responseBody = await readNativeResponsesBody(forward.response);
   } else if (forward.isGoogle) {
-    const rawData = (await forward.response.json()) as Record<string, unknown>;
+    const rawData = (await readProviderJson(forward.response)) as Record<string, unknown>;
     const googleData = forward.isCodeAssist ? unwrapCodeAssistResponse(rawData) : rawData;
     responseBody = providerClient.convertGoogleResponse(googleData, meta.model);
     const sigs = (responseBody as Record<string, unknown>)?._extractedSignatures as
@@ -648,7 +844,7 @@ export async function handleNonStreamResponse(
     // (`server_tool_use`, `web_search_tool_result`, etc.) survive. The
     // OpenAI-shaped converter only knows `text` / `thinking` / `tool_use`
     // and would silently drop the rest.
-    const anthropicData = (await forward.response.json()) as Record<string, unknown>;
+    const anthropicData = (await readProviderJson(forward.response)) as Record<string, unknown>;
     const extracted = extractThinkingBlocksFromMessagesResponse(anthropicData);
     if (extracted && thinkingCache && sessionKey) {
       thinkingCache.store(
@@ -660,7 +856,7 @@ export async function handleNonStreamResponse(
     }
     responseBody = anthropicData;
   } else if (forward.isAnthropic) {
-    const anthropicData = (await forward.response.json()) as Record<string, unknown>;
+    const anthropicData = (await readProviderJson(forward.response)) as Record<string, unknown>;
     responseBody = providerClient.convertAnthropicResponse(anthropicData, meta.model);
     const extracted = (responseBody as Record<string, unknown>)?._extractedThinkingBlocks as
       | ExtractedThinkingBlocks
@@ -680,10 +876,15 @@ export async function handleNonStreamResponse(
     const sseText = await forward.response.text();
     responseBody = providerClient.collectChatGptSseResponse(sseText, meta.model);
   } else {
-    responseBody = await forward.response.json();
+    responseBody = await readProviderJson(forward.response);
     if (supportsReasoningContent(meta.provider, meta.model)) {
       cacheReasoningContent(responseBody, reasoningCache, sessionKey);
     }
+  }
+
+  if (apiMode === 'messages') {
+    if (forward.isAnthropic) assertAnthropicCompletionIntegrity(responseBody);
+    else assertChatCompletionIntegrity(responseBody);
   }
 
   if (apiMode === 'responses' && !forward.isResponses) {
@@ -787,35 +988,17 @@ export function recordSuccess(
     );
   }
 
-  // Record the failed original as its own `auto_fixed` row ONLY when healing
-  // actually succeeded — that row is linked to the retry above via groupId and
-  // is the sole record of the pre-heal failure. When healing did NOT heal, the
-  // primary failure is already recorded exactly once elsewhere (the terminal
-  // error row, or the `fallback_error` row when a fallback took over), both of
-  // which carry the Auto-fix stamp — so emitting an `auto_fixed` row here too
-  // would double-count the same failure (and under the wrong, fallback model).
-  // `!meta.fallbackFromModel`: if a fallback took over after the heal, `meta.model`
-  // here is the fallback route, and the fallback path already stamps the pre-heal
-  // failure with the Auto-fix audit — so recording a standalone `auto_fixed` row
-  // now would double-count it under the wrong model.
-  if (autofix && autofix.outcome === 'healed' && !meta.fallbackFromModel) {
-    recordSafely(
-      recorder.recordAutofixOriginals(ctx, meta.model, meta.tier, autofix, {
-        provider: meta.provider,
-        reason: meta.reason,
-        authType: meta.auth_type,
-        traceId,
-        callerAttribution,
-        requestHeaders,
-        requestParams: meta.request_params,
-        specificityCategory: meta.specificity_category,
-        providerKeyLabel: meta.provider_key_label,
-        tenantProviderId: meta.tenantProviderId,
-        headerTierId: meta.header_tier_id,
-        headerTierName: meta.header_tier_name,
-        headerTierColor: meta.header_tier_color,
-      }),
-      'autofix originals',
+  // Fallback-success flows recorded the original and failed retry above in
+  // recordFallbackFailures. A direct Auto-fix success records its original here.
+  if (!meta.fallbackFromModel) {
+    recordAutofixOriginalIfRetried(
+      ctx,
+      meta,
+      recorder,
+      autofix,
+      traceId,
+      callerAttribution,
+      requestHeaders,
     );
   }
 }
