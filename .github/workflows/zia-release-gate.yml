@@ -25,10 +25,13 @@ jobs:
     uses: ./.github/workflows/docker-smoke.yml
 
   production_smoke:
-    name: Deployed production smoke (read-only)
+    name: Deployed production contract checks
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
+      - name: Check out release canary
+        uses: actions/checkout@v4
+
       - name: Verify public health
         run: |
           response=$(curl --fail --silent --show-error --retry 2 \
@@ -54,6 +57,18 @@ jobs:
             echo "Expected the invalid-key chunked probe to return 401; got $status." >&2
             exit 1
           fi
+
+      - name: Verify SOL response contract and exact synthetic reply
+        env:
+          MANIFEST_CANARY_BASE_URL: https://manifest.ziahamza.com
+          MANIFEST_CANARY_API_KEY: ${{ secrets.MANIFEST_CANARY_SOL_API_KEY }}
+        run: npm run canary:gateway
+
+      - name: Verify Opus response contract and exact synthetic reply
+        env:
+          MANIFEST_CANARY_BASE_URL: https://manifest.ziahamza.com
+          MANIFEST_CANARY_API_KEY: ${{ secrets.MANIFEST_CANARY_OPUS_API_KEY }}
+        run: npm run canary:gateway
 
   all_green:
     name: All green
