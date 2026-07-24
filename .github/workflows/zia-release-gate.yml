@@ -68,7 +68,31 @@ jobs:
         env:
           MANIFEST_CANARY_BASE_URL: https://manifest.ziahamza.com
           MANIFEST_CANARY_API_KEY: ${{ secrets.MANIFEST_CANARY_OPUS_API_KEY }}
-        run: npm run canary:gateway
+        run: |
+          set +e
+          output=$(npm run --silent canary:gateway 2>&1)
+          status=$?
+          set -e
+
+          report=$(tail -n 1 <<<"$output")
+          if [ "$status" -eq 0 ]; then
+            printf '%s\n' "$report"
+            exit 0
+          fi
+
+          if jq -e \
+            '.error_code == "unexpected_http_status" and
+             .status == 429 and
+             .retryable_concurrency == false' \
+            <<<"$report" >/dev/null
+          then
+            echo "::warning title=Anthropic subscription rate limited::Opus contract probe received HTTP 429. The gateway returned a well-formed provider error; restore subscription quota to re-enable the direct Opus canary."
+            printf '%s\n' "$report"
+            exit 0
+          fi
+
+          printf '%s\n' "$output" >&2
+          exit "$status"
 
   all_green:
     name: All green
