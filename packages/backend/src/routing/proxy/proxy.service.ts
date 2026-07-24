@@ -875,14 +875,21 @@ export class ProxyService {
     requestedModel: string,
   ): Promise<ResolvedRouting | null> {
     const models = await this.modelDiscovery.getModelsForAgent(tenantId, agentId);
-    const candidates = models.filter(
-      (model) =>
-        model.provider.toLowerCase() === 'anthropic' &&
-        model.id === requestedModel &&
-        model.authType,
+    const anthropicModels = models.filter(
+      (model) => model.provider.toLowerCase() === 'anthropic' && model.authType,
     );
-    const model =
-      candidates.find((candidate) => candidate.authType === 'subscription') ?? candidates[0];
+    const candidates = [
+      ...(requestedModel === 'default'
+        ? anthropicModels
+        : anthropicModels.filter((model) => model.id === requestedModel)),
+    ].sort(
+      (a, b) =>
+        Number(b.authType === 'subscription') - Number(a.authType === 'subscription') ||
+        b.qualityScore - a.qualityScore ||
+        b.contextWindow - a.contextWindow ||
+        a.id.localeCompare(b.id),
+    );
+    const model = candidates[0];
     if (!model?.authType) {
       this.logger.warn(
         `Claude Auto classifier model "${requestedModel}" is unavailable for agent=${agentId}`,
@@ -891,7 +898,8 @@ export class ProxyService {
     }
 
     this.logger.debug(
-      `Claude Auto classifier: preserving model=${requestedModel} provider=anthropic auth_type=${model.authType}`,
+      `Claude Auto classifier: preserving model=${model.id} provider=anthropic auth_type=${model.authType}` +
+        (model.id === requestedModel ? '' : ` requested_model=${requestedModel}`),
     );
     return {
       tier: 'default' as const,
