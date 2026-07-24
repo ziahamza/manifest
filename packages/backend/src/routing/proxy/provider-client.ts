@@ -47,7 +47,10 @@ export interface ForwardResult {
   /** Provider-facing API shape of {@link wireRequestBody}. */
   wireApiMode?: ProxyApiMode;
   /** Re-send a healed wire body through the already-resolved transport. */
-  retryWireBody?: (body: Record<string, unknown>) => Promise<ForwardResult>;
+  retryWireBody?: (
+    body: Record<string, unknown>,
+    options?: { preResponseTimeoutMs?: number; semanticOutputTimeoutMs?: number },
+  ) => Promise<ForwardResult>;
   /** False only when Manifest produced a response without invoking provider transport. */
   providerCallStarted?: boolean;
   /** Persisted provider-call identity, when request tracking is available. */
@@ -442,6 +445,7 @@ export class ProviderClient {
 
     const retryWireBody = async (
       wireRequestBody: Record<string, unknown>,
+      retryOptions?: { preResponseTimeoutMs?: number; semanticOutputTimeoutMs?: number },
     ): Promise<ForwardResult> => {
       this.logger.debug(`Forwarding to ${endpointKey}: ${url.replace(/key=[^&]+/, 'key=***')}`);
 
@@ -457,22 +461,31 @@ export class ProviderClient {
         }
       }
 
-      const result = await this.executeFetch(url, finalHeaders, wireRequestBody, signal, stream, {
-        isGoogle,
-        isAnthropic,
-        isChatGpt,
-        isResponses,
-        isCodeAssist,
-        structuredOutputToolName,
-        responsesTextFormat: textFormat,
-        responsesToolTypesByName: toolTypesByName,
-      });
+      const result = await this.executeFetch(
+        url,
+        finalHeaders,
+        wireRequestBody,
+        signal,
+        stream,
+        retryOptions?.preResponseTimeoutMs ?? opts.preResponseTimeoutMs,
+        {
+          isGoogle,
+          isAnthropic,
+          isChatGpt,
+          isResponses,
+          isCodeAssist,
+          structuredOutputToolName,
+          responsesTextFormat: textFormat,
+          responsesToolTypesByName: toolTypesByName,
+        },
+      );
       const qualifiedResult =
         endpointKey === 'openai-subscription'
           ? {
               ...result,
               response: await qualifyChatGptResponse(result.response, {
                 downstreamFormat: isResponses ? 'responses' : 'chat-completions',
+                timeoutMs: retryOptions?.semanticOutputTimeoutMs ?? opts.semanticOutputTimeoutMs,
               }),
             }
           : result;
@@ -826,6 +839,7 @@ export class ProviderClient {
     requestBody: Record<string, unknown>,
     signal: AbortSignal | undefined,
     stream: boolean,
+    preResponseTimeoutMs: number | undefined,
     formatFlags: {
       isGoogle: boolean;
       isAnthropic: boolean;
@@ -841,7 +855,11 @@ export class ProviderClient {
     // fetch() resolves as soon as headers arrive, then the body is guarded by
     // an idle watchdog below. Long active streams can exceed this duration,
     // but a silent provider still fails before Cloudflare's proxy read window.
-    const timeoutMs = stream ? PROVIDER_STREAM_TIMEOUT_MS : PROVIDER_TIMEOUT_MS;
+    const providerTimeoutMs = stream ? PROVIDER_STREAM_TIMEOUT_MS : PROVIDER_TIMEOUT_MS;
+    const timeoutMs =
+      preResponseTimeoutMs === undefined
+        ? providerTimeoutMs
+        : Math.max(1, Math.min(providerTimeoutMs, Math.floor(preResponseTimeoutMs)));
     let timeout: ReturnType<typeof setTimeout> | undefined;
     let timeoutSignal: AbortSignal;
     if (stream) {
