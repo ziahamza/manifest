@@ -1,0 +1,118 @@
+name: Zia Release Gate
+
+# Fork-only rollup validation for the production integration branch. This file
+# intentionally lives on zia/release and is not proposed upstream.
+on:
+  push:
+    branches: [zia/release]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: zia-release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  repository_ci:
+    name: Repository CI
+    uses: ./.github/workflows/ci.yml
+    secrets: inherit
+
+  container_smoke:
+    name: Container and gateway smoke
+    uses: ./.github/workflows/docker-smoke.yml
+
+  production_smoke:
+    name: Deployed production contract checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out release canary
+        uses: actions/checkout@v4
+
+      - name: Verify public health
+        run: |
+          response=$(curl --fail --silent --show-error --retry 2 \
+            --retry-delay 2 \
+            https://manifest.ziahamza.com/api/v1/health)
+          jq -e '.status == "healthy"' <<<"$response" >/dev/null
+
+      - name: Verify chunked Claude requests are not rejected with 411
+        run: |
+          status=$(
+            printf '%s' '{"model":"claude-sonnet-4-6","max_tokens":1,"messages":[{"role":"user","content":"synthetic release probe"}]}' |
+              curl --http1.1 --silent --show-error \
+                --output /tmp/chunked-response.json \
+                --write-out '%{http_code}' \
+                --request POST https://manifest.ziahamza.com/v1/messages \
+                --header 'Authorization: Bearer invalid-zia-release-probe' \
+                --header 'Content-Type: application/json' \
+                --header 'Transfer-Encoding: chunked' \
+                --data-binary @-
+          )
+
+          if [ "$status" != "401" ]; then
+            echo "Expected the invalid-key chunked probe to return 401; got $status." >&2
+            exit 1
+          fi
+
+      - name: Verify SOL response contract and exact synthetic reply
+        env:
+          MANIFEST_CANARY_BASE_URL: https://manifest.ziahamza.com
+          MANIFEST_CANARY_API_KEY: ${{ secrets.MANIFEST_CANARY_SOL_API_KEY }}
+        run: npm run canary:gateway
+
+      - name: Verify Opus response contract and exact synthetic reply
+        env:
+          MANIFEST_CANARY_BASE_URL: https://manifest.ziahamza.com
+          MANIFEST_CANARY_API_KEY: ${{ secrets.MANIFEST_CANARY_OPUS_API_KEY }}
+        run: |
+          set +e
+          output=$(npm run --silent canary:gateway 2>&1)
+          status=$?
+          set -e
+
+          report=$(tail -n 1 <<<"$output")
+          if [ "$status" -eq 0 ]; then
+            printf '%s\n' "$report"
+            exit 0
+          fi
+
+          if jq -e \
+            '.error_code == "unexpected_http_status" and
+             .status == 429 and
+             .retryable_concurrency == false' \
+            <<<"$report" >/dev/null
+          then
+            echo "::warning title=Anthropic subscription rate limited::Opus contract probe received HTTP 429. The gateway returned a well-formed provider error; restore subscription quota to re-enable the direct Opus canary."
+            printf '%s\n' "$report"
+            exit 0
+          fi
+
+          printf '%s\n' "$output" >&2
+          exit "$status"
+
+  all_green:
+    name: All green
+    if: always()
+    needs:
+      - repository_ci
+      - container_smoke
+      - production_smoke
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every release validation
+        env:
+          REPOSITORY_CI: ${{ needs.repository_ci.result }}
+          CONTAINER_SMOKE: ${{ needs.container_smoke.result }}
+          PRODUCTION_SMOKE: ${{ needs.production_smoke.result }}
+        run: |
+          printf 'Repository CI: %s\n' "$REPOSITORY_CI"
+          printf 'Container smoke: %s\n' "$CONTAINER_SMOKE"
+          printf 'Production smoke: %s\n' "$PRODUCTION_SMOKE"
+
+          test "$REPOSITORY_CI" = success
+          test "$CONTAINER_SMOKE" = success
+          test "$PRODUCTION_SMOKE" = success
